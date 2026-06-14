@@ -1,0 +1,39 @@
+# .github/workflows/scrape.yml
+name: Daily scrape
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # 8am UTC = ~4am ET, so deals are ready when you wake up
+  workflow_dispatch:        # lets you trigger it manually too
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r src/requirements.txt
+
+      - name: Download spaCy model
+        run: python -m spacy download en_core_web_sm
+
+      - run: python src/scraper.py --days 2
+
+      - name: Vacuum database
+        run: python -c "import sqlite3; conn = sqlite3.connect('src/sedar_filings.db'); conn.execute('VACUUM'); conn.close()"
+
+      - name: Commit updated DB
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -u
+          git diff --staged --quiet || git commit -m "chore: daily scrape $(date -u +%Y-%m-%d)"
+          git push
