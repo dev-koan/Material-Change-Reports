@@ -1,6 +1,6 @@
 """
-query_db.py  –  Inspect & query the SEDAR+ filings database
-============================================================
+query_db.py  –  Query Supabase filings database
+================================================
 
 Usage:
     python query_db.py                       # show last 20 filings
@@ -12,134 +12,176 @@ Usage:
     python query_db.py --stats               # show summary statistics
     python query_db.py --export filings.csv
 
-Sector labels (set automatically by enrichment.py):
+Sector labels:
     TMT, Mining, Unknown
 """
 
 import argparse
 import csv
-import sqlite3
-import sys
+import json
+import os
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "sedar_filings.db"
+import requests
+from dotenv import load_dotenv
+
+# ── Load environment variables ────────────────────────────────────────────────
+
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+else:
+    load_dotenv()
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 
-def get_conn(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    if not db_path.exists():
-        print(f"[error] Database not found at {db_path}")
-        print("        Run scraper.py first to create it.")
-        sys.exit(1)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+class SupabaseClient:
+    def __init__(self):
+        self.url = SUPABASE_URL
+        self.key = SUPABASE_KEY
+        self.headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+        }
+
+    def query(self, params: dict) -> list[dict]:
+        """Execute a query against the filings table."""
+        if not self.url or not self.key:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_KEY must be set in .env or environment")
+        
+        resp = requests.get(
+            f"{self.url}/rest/v1/filings",
+            params=params,
+            headers=self.headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_stats(self) -> dict:
+        """Get summary statistics."""
+        # Total count
+        total = self.query({"select": "id", "limit": 0})
+        # We need to get the count from headers
+        resp = requests.get(
+            f"{self.url}/rest/v1/filings",
+            params={"select": "id", "limit": 0},
+            headers=self.headers,
+        )
+        total_count = int(resp.headers.get("Content-Range", "0/0").split("/")[-1] or 0)
+        
+        # Min/max dates
+        date_stats = self.query({
+            "select": "filing_date",
+            "order": "filing_date.asc",
+            "limit": 1,
+        })
+        oldest = date_stats[0]["filing_date"] if date_stats else None
+        
+        newest_stats = self.query({
+            "select": "filing_date",
+            "order": "filing_date.desc",
+            "limit": 1,
+        })
+        newest = newest_stats[0]["filing_date"] if newest_stats else None
+        
+        # Top issuers
+        # Since we can't do GROUP BY directly, we'll get all and count locally
+        all_rows = self.query({
+            "select": "issuer_name",
+            "limit": 1000,  # Reasonable limit
+        })
+        issuer_counts = {}
+        for row in all_rows:
+            issuer = row.get("issuer_name", "Unknown")
+            issuer_counts[issuer] = issuer_counts.get(issuer, 0) + 1
+        top_issuers = sorted(issuer_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        
+        # Sector counts
+        sector_counts = {}
+        sector_rows = self.query({
+            "select": "sector",
+            "limit": 1000,
+        })
+        for row in sector_rows:
+            sector = row.get("sector", "Unknown")
+            if sector is None:
+                sector = "Unknown"
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        
+        return {
+            "total": total_count,
+            "oldest": oldest,
+            "newest": newest,
+            "top_issuers": top_issuers,
+            "sector_counts": sector_counts,
+        }
 
 
-def show_stats(conn: sqlite3.Connection) -> None:
-    total = conn.execute("SELECT COUNT(*) FROM filings").fetchone()[0]
-    oldest = conn.execute("SELECT MIN(filing_date) FROM filings").fetchone()[0]
-    newest = conn.execute("SELECT MAX(filing_date) FROM filings").fetchone()[0]
+def get_client() -> SupabaseClient:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("[error] SUPABASE_URL and SUPABASE_KEY must be set")
+        print("        Create a .env file in the project root with:")
+        print("        SUPABASE_URL=https://your-project-id.supabase.co")
+        print("        SUPABASE_KEY=your-service-role-key")
+        exit(1)
+    return SupabaseClient()
+
+
+def show_stats(client: SupabaseClient) -> None:
+    stats = client.get_stats()
+    
     print(f"\n── Database Statistics ─────────────────────────────────────")
-    print(f"  Total filings : {total:,}")
-    print(f"  Oldest filing : {oldest}")
-    print(f"  Newest filing : {newest}")
+    print(f"  Total filings : {stats['total']:,}")
+    print(f"  Oldest filing : {stats['oldest']}")
+    print(f"  Newest filing : {stats['newest']}")
 
     print(f"\n── Top 10 Issuers ──────────────────────────────────────────")
-    rows = conn.execute("""
-        SELECT issuer_name, COUNT(*) AS cnt
-        FROM filings
-        GROUP BY issuer_name
-        ORDER BY cnt DESC
-        LIMIT 10
-    """).fetchall()
-    for r in rows:
-        print(f"  {r['cnt']:>4}  {r['issuer_name']}")
-
-    print(f"\n── Filings by Jurisdiction ─────────────────────────────────")
-    rows = conn.execute("""
-        SELECT jurisdiction, COUNT(*) AS cnt
-        FROM filings
-        GROUP BY jurisdiction
-        ORDER BY cnt DESC
-    """).fetchall()
-    for r in rows:
-        j = r["jurisdiction"] or "(unknown)"
-        print(f"  {r['cnt']:>4}  {j}")
+    for issuer, count in stats['top_issuers']:
+        issuer_display = issuer if issuer else "(unknown)"
+        print(f"  {count:>4}  {issuer_display}")
 
     print(f"\n── Filings by Sector ───────────────────────────────────────")
-    rows = conn.execute("""
-        SELECT COALESCE(sector, 'Unknown') AS sector, COUNT(*) AS cnt
-        FROM filings
-        GROUP BY sector
-        ORDER BY cnt DESC
-    """).fetchall()
-    for r in rows:
-        print(f"  {r['cnt']:>4}  {r['sector']}")
+    for sector, count in sorted(stats['sector_counts'].items(), key=lambda x: x[1], reverse=True):
+        print(f"  {count:>4}  {sector}")
     print()
 
 
 def list_filings(
-    conn: sqlite3.Connection,
+    client: SupabaseClient,
     issuer: str | None,
     since: str | None,
     sector: str | None,
     limit: int,
-) -> tuple[list[sqlite3.Row], bool]:
-    """
-    Returns (rows, has_sector_column) where has_sector_column indicates
-    if the sector column exists in the database.
-    """
-    # First, check if sector column exists
-    has_sector = False
-    try:
-        # Try to select sector column - will error if it doesn't exist
-        conn.execute("SELECT sector FROM filings LIMIT 1")
-        has_sector = True
-    except sqlite3.OperationalError:
-        # Column doesn't exist yet - run enrichment first
-        print("\n[WARNING] 'sector' column not found in database.")
-        print("        Run 'python enrichment.py' first to add sector classification.\n")
+) -> list[dict]:
+    """Query and return filings matching the filters."""
+    params = {
+        "select": "*",
+        "order": "filing_date.desc",
+        "limit": str(limit),
+    }
     
-    # Build query - if sector column doesn't exist and user filters by it, adjust
-    query = "SELECT * FROM filings WHERE 1=1"
-    params: list = []
-
     if issuer:
-        query += " AND issuer_name LIKE ?"
-        params.append(f"%{issuer}%")
-
+        # Use text search for issuer_name
+        params["issuer_name"] = f"ilike.%{issuer}%"
+    
     if since:
-        query += " AND filing_date >= ?"
-        params.append(since)
-
+        params["filing_date"] = f"gte.{since}"
+    
     if sector:
-        if has_sector:
-            query += " AND sector = ?"
-            params.append(sector)
-        else:
-            print(f"[WARNING] Cannot filter by sector '{sector}' - column doesn't exist yet.")
-
-    query += " ORDER BY filing_date DESC LIMIT ?"
-    params.append(limit)
-
-    return (conn.execute(query, params).fetchall(), has_sector)
+        params["sector"] = f"eq.{sector}"
+    
+    return client.query(params)
 
 
-def print_table(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> None:
+def print_results(rows: list[dict]) -> None:
+    """Print filings in a formatted table."""
     if not rows:
         print("No filings matched your query.")
         return
-
-    # Detect whether the enriched columns exist in this result set
-    keys = rows[0].keys()
-    has_sector    = "sector" in keys
-    has_companies = "companies" in keys
-    
-    # If sector column exists but all values are NULL, show warning
-    if has_sector:
-        sample = conn.execute("SELECT COUNT(*) FROM filings WHERE sector IS NOT NULL").fetchone()[0]
-        if sample == 0:
-            print("\n[INFO] Sector column exists but no data yet. Run 'python enrichment.py' to classify.\n")
 
     col_widths = {
         "filing_date":  12,
@@ -153,34 +195,31 @@ def print_table(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> None:
         f"{'Date':<{col_widths['filing_date']}}  "
         f"{'Issuer':<{col_widths['issuer_name']}}  "
         f"{'Headline':<{col_widths['headline']}}  "
-        f"{'Jur.':<{col_widths['jurisdiction']}}"
+        f"{'Jur.':<{col_widths['jurisdiction']}}  "
+        f"{'Sector':<{col_widths['sector']}}"
     )
-    if has_sector:
-        header += f"  {'Sector':<{col_widths['sector']}}"
 
     print(f"\n{header}")
     print("─" * len(header))
 
     for r in rows:
-        issuer   = (r["issuer_name"] or "")[:col_widths["issuer_name"]]
-        headline = (r["headline"]    or "")[:col_widths["headline"]]
-        jur      = (r["jurisdiction"]or "")[:col_widths["jurisdiction"]]
+        issuer   = (r.get("issuer_name") or "")[:col_widths["issuer_name"]]
+        headline = (r.get("headline")    or "")[:col_widths["headline"]]
+        jur      = (r.get("jurisdiction")or "")[:col_widths["jurisdiction"]]
+        sector   = (r.get("sector") or "Unknown")[:col_widths["sector"]]
 
         line = (
-            f"{r['filing_date']!s:<{col_widths['filing_date']}}  "
+            f"{r['filing_date']:<{col_widths['filing_date']}}  "
             f"{issuer:<{col_widths['issuer_name']}}  "
             f"{headline:<{col_widths['headline']}}  "
-            f"{jur:<{col_widths['jurisdiction']}}"
+            f"{jur:<{col_widths['jurisdiction']}}  "
+            f"{sector:<{col_widths['sector']}}"
         )
-        if has_sector:
-            sector = (r["sector"] or "Unknown")[:col_widths["sector"]]
-            line += f"  {sector:<{col_widths['sector']}}"
         print(line)
 
-        if r["url"]:
+        if r.get("url"):
             print(f"   └─ {r['url']}")
-        if has_companies and r["companies"] and r["companies"].strip():
-            # Show each pipe-delimited company on its own indented line
+        if r.get("companies") and r["companies"].strip():
             companies_list = r["companies"].split(" | ")
             for company in companies_list:
                 if company and company.strip():
@@ -189,7 +228,7 @@ def print_table(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> None:
     print(f"\n{len(rows)} filing(s) shown.\n")
 
 
-def export_csv(rows: list[sqlite3.Row], path: str) -> None:
+def export_csv(rows: list[dict], path: str) -> None:
     if not rows:
         print("Nothing to export.")
         return
@@ -197,12 +236,12 @@ def export_csv(rows: list[sqlite3.Row], path: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows([dict(r) for r in rows])
+        writer.writerows(rows)
     print(f"Exported {len(rows)} rows to {path}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Query the SEDAR+ filings database.")
+    parser = argparse.ArgumentParser(description="Query the Supabase filings database.")
     parser.add_argument("--limit",  type=int,  default=20, help="Max rows to display (default: 20)")
     parser.add_argument("--issuer", type=str,  default=None, help="Filter by issuer name (partial match)")
     parser.add_argument("--since",  type=str,  default=None, help="Only show filings on/after YYYY-MM-DD")
@@ -212,19 +251,18 @@ def main() -> None:
     parser.add_argument("--export", type=str,  default=None, metavar="FILE.csv", help="Export results to CSV")
     args = parser.parse_args()
 
-    conn = get_conn()
+    client = get_client()
 
     if args.stats:
-        show_stats(conn)
+        show_stats(client)
         return
 
-    rows, has_sector = list_filings(conn, args.issuer, args.since, args.sector, args.limit)
+    rows = list_filings(client, args.issuer, args.since, args.sector, args.limit)
 
     if args.export:
         export_csv(rows, args.export)
     else:
-        # Pass has_sector to print_table or handle in print_table
-        print_table(conn, rows)
+        print_results(rows)
 
 
 if __name__ == "__main__":

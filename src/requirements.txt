@@ -1,3 +1,5 @@
 requests
 spacy
 streamlit
+python-dotenv
+

@@ -1,27 +1,19 @@
 """
-Code generate with Claude by Anthropic
-SEDAR+ / EDGAR / Newsfile Material Change Report Scraper
+scraper.py  –  Deal Sourcing Scraper (Supabase edition)
 =========================================================
-Pulls Material Change Reports from two complementary public sources:
+Pulls Material Change Reports from three sources:
 
-  1. SEC EDGAR EFTS (primary)  — free, no auth, documented REST API.
-     Canadian companies cross-listed on US exchanges file 6-K forms
-     that wrap their SEDAR+ MCRs.  Covers most TSX large/mid-caps.
+  1. SEC EDGAR EFTS (primary)
+  2. TMX Newsfile RSS feeds (supplemental)
+  3. Canadian media RSS feeds (supplemental)
 
-  2. TMX Newsfile RSS feeds (supplemental)  — free, real RSS feeds
-     published by the official TMX newswire.  Catches TSX/TSXV/CSE-only
-     companies that never file with the SEC.
-     Mining feeds:  Mining and Metals, Precious Metals, Energy Metals, Rare Earths
-     TMT feeds:     Technology, Computer Software, Internet Technology,
-                    Semiconductors, Telecommunications, Cloud
+All results are upserted into Supabase (PostgreSQL) via the REST API.
+Deduplication is handled by a UNIQUE constraint on source_id.
+Rows older than 14 days are deleted after each run.
 
-  3. Canadian media RSS feeds (supplemental)  — broad deal coverage from
-     Financial Post, and Globe and Mail Business.  Items are
-     filtered by DEAL_KEYWORDS before storage so only M&A-relevant articles
-     are kept.
-
-All results are deduplicated by a source-specific ID and stored in a
-single local SQLite database — re-runs are always safe (INSERT OR IGNORE).
+Required env vars:
+    SUPABASE_URL   – e.g. https://xxxx.supabase.co
+    SUPABASE_KEY   – service_role key (not anon key — needs DELETE access)
 
 Usage:
     python scraper.py                     # fetch last 3 days, all sources
@@ -29,24 +21,23 @@ Usage:
     python scraper.py --source edgar      # EDGAR only
     python scraper.py --source newsfile   # Newsfile RSS only
     python scraper.py --source media      # Canadian media RSS only
-    python scraper.py --poll 300          # poll every 300 s
-    python scraper.py --limit 100         # cap new inserts per run
     python scraper.py --debug             # verbose logging
 """
 
 import argparse
 import logging
-import sqlite3
+import os
+from pathlib import Path
 import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
 
 import requests
 
-from enrichment import enrich_filing, migrate_schema
+from enrichment import enrich_filing
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -59,22 +50,13 @@ log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-DB_PATH = Path(__file__).parent / "sedar_filings.db"
-
-# EDGAR EFTS — free, no API key required.
-# SEC requires a descriptive User-Agent with contact info.
 EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
 
-# TMX Newsfile RSS feeds — official TMX newswire, free, no auth.
-# These cover TSX/TSXV/CSE companies that never touch EDGAR.
-# Each feed returns the latest 10 releases; poll frequently to catch all.
 NEWSFILE_FEEDS = {
-    # Mining
     "Mining and Metals":   "https://feeds.newsfilecorp.com/industry/mining-metals",
     "Precious Metals":     "https://feeds.newsfilecorp.com/industry/precious-metals",
     "Energy Metals":       "https://feeds.newsfilecorp.com/industry/energy-metals",
     "Rare Earths":         "https://feeds.newsfilecorp.com/industry/rare-earths",
-    # TMT (Technology, Media & Telecom)
     "Technology":          "https://feeds.newsfilecorp.com/industry/technology",
     "Computer Software":   "https://feeds.newsfilecorp.com/industry/computer-software",
     "Internet Technology": "https://feeds.newsfilecorp.com/industry/internet-technology",
@@ -83,16 +65,11 @@ NEWSFILE_FEEDS = {
     "Cloud":               "https://feeds.newsfilecorp.com/industry/cloud",
 }
 
-# Canadian media RSS feeds — broad business/deal coverage that catches
-# announcements before they appear in regulatory filings.
 CANADIAN_MEDIA_FEEDS = {
     "Financial Post":     "https://financialpost.com/feed",
     "Globe and Mail Biz": "https://www.theglobeandmail.com/arc/outboundfeeds/rss/category/business/",
 }
 
-# Keyword filter applied to Canadian media RSS items.
-# A headline or description must contain at least one keyword (case-insensitive)
-# to be stored.  Purely editorial articles are dropped.
 DEAL_KEYWORDS = [
     "acquisition",
     "merger",
@@ -103,347 +80,256 @@ DEAL_KEYWORDS = [
     "TSX",
 ]
 
-REQUEST_DELAY = 1.5   # seconds between paginated requests
+REQUEST_DELAY = 1.5
 
 HEADERS = {
-    # SEC requires org name + contact email in User-Agent
     "User-Agent": "DealSourcingBot/1.0 (research tool; contact@yourdomain.com)",
     "Accept-Encoding": "gzip, deflate",
     "Accept": "application/json, text/html, */*",
 }
 
-# ── Database ──────────────────────────────────────────────────────────────────
+# ── Supabase client ───────────────────────────────────────────────────────────
 
-def init_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+    log.info(f"Loaded environment from {env_path}")
+else:
+    # Try to load from current working directory
+    load_dotenv()
+    log.info("Loaded environment from current directory (or no .env found)")
+
+class SupabaseClient:
     """
-    Open (or create) the SQLite database and ensure the schema exists.
-    The DB file persists across runs — re-running scraper.py will NEVER
-    wipe existing data.  New rows are added; duplicates are silently skipped.
+    Thin wrapper around the Supabase REST API.
+    Uses only requests — no supabase-py SDK needed in CI.
     """
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS filings (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_id     TEXT    UNIQUE NOT NULL,  -- dedupe key per source
-            source        TEXT    NOT NULL,          -- 'edgar' | 'sedar'
-            issuer_name   TEXT,
-            doc_type      TEXT,
-            headline      TEXT,
-            filing_date   TEXT,
-            period_date   TEXT,
-            jurisdiction  TEXT,
-            form_type     TEXT,
-            url           TEXT,
-            fetched_at    TEXT    NOT NULL,
-            sector        TEXT,                      -- classified by enrichment.py
-            companies     TEXT                       -- pipe-delimited NER org names
-        )
-    """)
-    # migrate_schema(conn)  # adds columns to pre-existing DBs without losing data
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_date   ON filings (filing_date DESC);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_issuer ON filings (issuer_name COLLATE NOCASE);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_source ON filings (source);")
-    conn.commit()
-    log.info("Database ready → %s", db_path)
-    return conn
-
-
-def upsert_filing(conn: sqlite3.Connection, row: dict) -> bool:
-    """
-    Enrich then insert a filing; silently skip if source_id already exists.
-    Enrichment adds 'sector' (keyword classifier) and 'companies' (spaCy NER).
-    Returns True if a new row was inserted.
-    """
-    enrich_filing(row)  # adds 'sector' and 'companies' keys in-place
-    cur = conn.execute("""
-        INSERT OR IGNORE INTO filings
-            (source_id, source, issuer_name, doc_type, headline,
-             filing_date, period_date, jurisdiction, form_type, url, fetched_at,
-             sector, companies)
-        VALUES
-            (:source_id, :source, :issuer_name, :doc_type, :headline,
-             :filing_date, :period_date, :jurisdiction, :form_type, :url, :fetched_at,
-             :sector, :companies)
-    """, row)
-    conn.commit()
-    return cur.rowcount > 0
-
-
-# ── Source 1: EDGAR EFTS (primary) ────────────────────────────────────────────
-
-def _edgar_accession_to_url(accession: str) -> str:
-    """
-    Convert accession number (e.g. 0001234567-24-001234) to the EDGAR
-    filing index page URL.
-    """
-    clean = accession.replace("-", "")
-    cik   = clean[:10].lstrip("0")
-    return f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=6-K&dateb=&owner=include&count=10"
-
-
-def _edgar_hit_to_url(hit: dict) -> str:
-    """Build a direct link to the filing document on EDGAR."""
-    # _id is formatted as "ACCESSION:filename"
-    hit_id   = hit.get("_id", "")
-    source   = hit.get("_source", {})
-    adsh     = source.get("file_date", "")   # fallback
-
-    if ":" in hit_id:
-        accession, filename = hit_id.split(":", 1)
-        accession_path = accession.replace("-", "")
-        cik = accession_path[:10]
-        return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_path}/{filename}"
-
-    # Fallback: filing index
-    accession = hit_id
-    return f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0&type=6-K"
-
-
-def scrape_edgar(
-    conn: sqlite3.Connection,
-    session: requests.Session,
-    date_from: str,
-    date_to: str,
-) -> int:
-    """
-    Query EDGAR EFTS for 6-K filings containing 'material change report'.
-    Returns count of newly inserted rows.
-    """
-    log.info("[EDGAR] Searching 6-K filings  %s → %s", date_from, date_to)
-
-    new_count = 0
-    offset    = 0
-    page_size = 40
-    total     = None
-    now       = datetime.now(timezone.utc).isoformat()
-
-    # start = datetime.strptime(date_from, "%Y-%m-%d").strftime("%m/%d/%Y")
-    # end = datetime.strptime(date_to, "%Y-%m-%d").strftime("%m/%d/%Y")
-
-    while True:
-
-        params = {
-            "q":          '"material change report"',
-            "forms":      "6-K",
-            "dateRange":  "custom",
-            "startdt":    date_from,
-            "enddt":      date_to,
-            "from":       offset,
-            "size":       page_size,
+    def __init__(self):
+        self.url = os.environ["SUPABASE_URL"].rstrip("/")
+        self.key = os.environ["SUPABASE_KEY"]
+        self.headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=ignore-duplicates",  # upsert: skip on conflict
         }
 
+    def upsert(self, table: str, row: dict) -> bool:
+        """
+        Insert a row; silently skip if source_id already exists.
+        Returns True if a new row was inserted.
+        """
+        resp = requests.post(
+            f"{self.url}/rest/v1/{table}",
+            json=row,
+            headers={**self.headers, "Prefer": "resolution=ignore-duplicates,return=representation"},
+        )
+        if resp.status_code not in (200, 201):
+            log.warning("Supabase upsert failed (%s): %s", resp.status_code, resp.text[:200])
+            return False
+        # 201 = inserted, 200 with empty body = ignored duplicate
+        return resp.status_code == 201 and bool(resp.json())
+
+    def delete_old(self, table: str, date_col: str, cutoff: str) -> int:
+        """Delete rows where date_col < cutoff (ISO date string)."""
+        resp = requests.delete(
+            f"{self.url}/rest/v1/{table}",
+            params={date_col: f"lt.{cutoff}"},
+            headers={**self.headers, "Prefer": "return=representation"},
+        )
+        if resp.status_code not in (200, 204):
+            log.warning("Supabase delete failed (%s): %s", resp.status_code, resp.text[:200])
+            return 0
+        try:
+            deleted = len(resp.json())
+        except Exception:
+            deleted = 0
+        return deleted
+
+
+def get_supabase() -> SupabaseClient:
+    if not os.environ.get("SUPABASE_URL") or not os.environ.get("SUPABASE_KEY"):
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_KEY must be set as environment variables.\n"
+            "In GitHub Actions: add them as repository secrets.\n"
+            "Locally: export them in your shell or add to a .env file."
+        )
+    return SupabaseClient()
+
+
+# ── Filing upsert ─────────────────────────────────────────────────────────────
+
+def upsert_filing(db: SupabaseClient, row: dict) -> bool:
+    """Enrich then upsert a filing. Returns True if newly inserted."""
+    enrich_filing(row)
+    return db.upsert("filings", row)
+
+
+# ── Helpers (shared with original scraper) ────────────────────────────────────
+
+def _parse_rss_date(raw: str) -> str:
+    """Parse RFC 2822 or ISO date string → YYYY-MM-DD. Falls back to today."""
+    if not raw:
+        return date.today().isoformat()
+    try:
+        return parsedate_to_datetime(raw).date().isoformat()
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw[:19], fmt).date().isoformat()
+        except ValueError:
+            continue
+    return date.today().isoformat()
+
+
+def _extract_ticker(text: str):
+    """
+    Pull the first (EXCHANGE: TICKER) pattern from text.
+    Returns (ticker, jurisdiction) or (None, None).
+    """
+    import re
+    m = re.search(r"\((?P<ex>TSX(?:V)?|CSE|NYSE|NASDAQ):\s*(?P<tk>[A-Z0-9.]+)\)", text)
+    if not m:
+        return None, None
+    ex = m.group("ex")
+    tk = m.group("tk")
+    jurisdiction = "CA" if ex in ("TSX", "TSXV", "CSE") else "US"
+    return tk, jurisdiction
+
+
+# ── Source 1: EDGAR EFTS ──────────────────────────────────────────────────────
+
+def scrape_edgar(db: SupabaseClient, session: requests.Session, date_from: str, date_to: str) -> int:
+    log.info("[EDGAR] Scraping %s → %s", date_from, date_to)
+    new_count = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    params = {
+        "q":        '"material change"',
+        "dateRange": "custom",
+        "startdt":  date_from,
+        "enddt":    date_to,
+        "forms":    "6-K",
+        "_source":  "hits.hits._source,hits.hits._id",
+        "from":     0,
+        "size":     40,
+    }
+
+    while True:
         try:
             resp = session.get(EDGAR_SEARCH_URL, params=params, headers=HEADERS, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-        except requests.HTTPError as e:
-            log.error("[EDGAR] HTTP error: %s", e)
-            break
-        except ValueError as e:
-            log.error("[EDGAR] JSON parse error: %s  —  body: %.200s", e, resp.text)
-            break
-        except requests.RequestException as e:
+        except Exception as e:
             log.error("[EDGAR] Request failed: %s", e)
             break
 
-        hits_block = data.get("hits", {})
-        if total is None:
-            total_info = hits_block.get("total", {})
-            total = total_info.get("value", 0) if isinstance(total_info, dict) else total_info
-            log.info("[EDGAR] Total matching filings: %s", total)
-
-        hits = hits_block.get("hits", [])
+        hits = data.get("hits", {}).get("hits", [])
         if not hits:
-            log.info("[EDGAR] No more results at offset=%d", offset)
             break
 
         for hit in hits:
-            src  = hit.get("_source", {})
-            name = src.get("display_names")
-            if isinstance(name, list) and name:
-                first = name[0]
-                # EDGAR returns either a dict {"name": "..."} or a plain string
-                issuer_name = first.get("name", "") if isinstance(first, dict) else str(first)
-            else:
-                issuer_name = src.get("entity_name", "")
+            src = hit.get("_source", {})
+            hit_id = hit.get("_id", "")
+
+            accession = hit_id.split(":")[0] if ":" in hit_id else hit_id
+            accession_path = accession.replace("-", "")
+            cik = accession_path[:10]
+            filename = hit_id.split(":", 1)[1] if ":" in hit_id else ""
+            url = (
+                f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_path}/{filename}"
+                if filename else
+                f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=6-K"
+            )
 
             filing = {
-                "source_id":   hit.get("_id", ""),
-                "source":      "edgar",
-                "issuer_name": issuer_name,
-                "doc_type":    "Material Change Report",
-                "headline":    src.get("file_description") or f"6-K — {issuer_name}",
-                "filing_date": src.get("file_date", ""),
-                "period_date": src.get("period_of_report", ""),
-                "jurisdiction":"CA",
-                "form_type":   src.get("form_type", "6-K"),
-                "url":         _edgar_hit_to_url(hit),
-                "fetched_at":  now,
+                "source_id":    f"edgar:{accession}",
+                "source":       "edgar",
+                "issuer_name":  src.get("entity_name", src.get("display_names", [""])[0] if src.get("display_names") else ""),
+                "doc_type":     src.get("file_type", "6-K"),
+                "headline":     src.get("period_of_report", src.get("file_date", "")),
+                "filing_date":  src.get("file_date", date_from)[:10],
+                "period_date":  src.get("period_of_report", ""),
+                "jurisdiction": "US",
+                "form_type":    "6-K",
+                "url":          url,
+                "fetched_at":   now,
             }
 
-            if not filing["source_id"]:
-                continue
-
-            inserted = upsert_filing(conn, filing)
+            inserted = upsert_filing(db, filing)
             if inserted:
                 new_count += 1
-                log.info(
-                    "[EDGAR][NEW] %-45s  %s  %s",
-                    (issuer_name or "?")[:45],
-                    filing["filing_date"],
-                    filing["url"],
-                )
+                log.info("[EDGAR][NEW] %s  %s", filing["issuer_name"][:50], filing["filing_date"])
 
-        offset += len(hits)
-        if offset >= (total or 0):
+        total = data.get("hits", {}).get("total", {}).get("value", 0)
+        params["from"] += len(hits)
+        if params["from"] >= total or params["from"] >= 200:
             break
 
         time.sleep(REQUEST_DELAY)
 
-    log.info("[EDGAR] Done. %d new filings inserted (scanned %d).", new_count, offset)
+    log.info("[EDGAR] Done. %d new filings stored.", new_count)
     return new_count
 
 
-# ── Source 2: TMX Newsfile RSS feeds (supplemental) ──────────────────────────
+# ── Source 2: Newsfile RSS ────────────────────────────────────────────────────
 
-def _parse_rss_date(date_str: str) -> str:
-    """
-    Convert an RFC-2822 RSS pubDate string (e.g. 'Tue, 09 Jun 2026 17:30:00 -0400')
-    to a plain YYYY-MM-DD string.  Returns the raw string on any parse failure.
-    """
-    try:
-        return parsedate_to_datetime(date_str).strftime("%Y-%m-%d")
-    except Exception:
-        return date_str
-
-
-def _extract_ticker(text: str) -> tuple[str, str]:
-    """
-    Pull the first exchange:ticker tag from a headline or description,
-    e.g. '(TSXV: AZEM)' → ('TSXV:AZEM', 'CA')
-    Returns (ticker_string, jurisdiction) where jurisdiction is 'CA' or 'US'.
-    Returns ('', 'CA') if not found (default to Canadian).
-    """
-    import re
-    # Canadian exchanges
-    ca_pattern = r'\((TSX(?:V)?|CSE):\s*([A-Z0-9.]+)\)'
-    ca_match = re.search(ca_pattern, text, re.IGNORECASE)
-    if ca_match:
-        exchange = ca_match.group(1).upper()
-        ticker = ca_match.group(2).upper()
-        return (f"{exchange}:{ticker}", "CA")
-    
-    # US exchanges
-    us_pattern = r'\((NYSE|NASDAQ):\s*([A-Z0-9.]+)\)'
-    us_match = re.search(us_pattern, text, re.IGNORECASE)
-    if us_match:
-        exchange = us_match.group(1).upper()
-        ticker = us_match.group(2).upper()
-        return (f"{exchange}:{ticker}", "US")
-    
-    return ("", "CA")  # Default to Canada
-
-
-def scrape_newsfile(
-    conn: sqlite3.Connection,
-    session: requests.Session,
-    date_from: str,
-    date_to: str,
-) -> int:
-    """
-    Poll the TMX Newsfile RSS feeds for mining-sector news releases.
-
-    Note: these feeds return the latest 10 items across ALL release types
-    (not just MCRs).  We store everything — the AI triage step in Step 3
-    will classify and filter.  The feed updates in near real-time so polling
-    every few minutes with --days 1 catches everything.
-
-    Each feed covers TSX/TSXV/CSE companies that don't file with the SEC,
-    filling the gap left by EDGAR.
-    """
+def scrape_newsfile(db: SupabaseClient, session: requests.Session, date_from: str, date_to: str) -> int:
+    log.info("[Newsfile] Scraping feeds %s → %s", date_from, date_to)
     new_count = 0
+    cutoff_from = datetime.strptime(date_from, "%Y-%m-%d").date()
+    cutoff_to   = datetime.strptime(date_to,   "%Y-%m-%d").date()
     now = datetime.now(timezone.utc).isoformat()
 
     for feed_name, feed_url in NEWSFILE_FEEDS.items():
-        log.info("[Newsfile] Fetching '%s' feed", feed_name)
-
+        log.info("[Newsfile] Fetching '%s'", feed_name)
         try:
             resp = session.get(feed_url, headers=HEADERS, timeout=20)
             resp.raise_for_status()
-        except requests.RequestException as e:
-            log.warning("[Newsfile] Failed to fetch '%s': %s", feed_name, e)
-            continue
-
-        try:
             root = ET.fromstring(resp.content)
-        except ET.ParseError as e:
-            log.warning("[Newsfile] XML parse error for '%s': %s", feed_name, e)
+        except Exception as e:
+            log.warning("[Newsfile] Failed '%s': %s", feed_name, e)
             continue
 
-        # RSS namespace used by Newsfile (none needed for standard elements)
-        items = root.findall(".//item")
-        log.info("[Newsfile] '%s' — %d items in feed", feed_name, len(items))
-
-        for item in items:
+        for item in root.findall(".//item"):
             title   = (item.findtext("title")   or "").strip()
             link    = (item.findtext("link")     or "").strip()
             pub_raw = (item.findtext("pubDate")  or "").strip()
-            desc    = (item.findtext("description") or "").strip()
             guid    = (item.findtext("guid")     or link).strip()
 
             filed_date = _parse_rss_date(pub_raw)
-
-            # Filter to the requested date window
             try:
-                if filed_date:
-                    item_date = datetime.strptime(filed_date, "%Y-%m-%d").date()
-                    cutoff_from = datetime.strptime(date_from, "%Y-%m-%d").date()
-                    cutoff_to = datetime.strptime(date_to, "%Y-%m-%d").date()
-                    if item_date and (item_date < cutoff_from or item_date > cutoff_to):
-                        log.debug("[Newsfile] Skipping item dated %s (outside %s to %s)", 
-                            filed_date, date_from, date_to)
-                        continue  
-            except (ValueError, TypeError):
-                pass  # 
+                item_date = datetime.strptime(filed_date, "%Y-%m-%d").date()
+                if item_date < cutoff_from or item_date > cutoff_to:
+                    continue
+            except ValueError:
+                pass
 
-            # Try to extract ticker from title for easier downstream enrichment
             ticker, jurisdiction = _extract_ticker(title)
-            if not ticker:
-                ticker, jurisdiction = _extract_ticker(desc)
-            if not ticker:
-                jurisdiction = "CA"
 
-            # Strip HTML tags from description for clean storage
-            import re
-            clean_desc = re.sub(r"<[^>]+>", "", desc).strip()
-            # Trim to a reasonable headline length
-            headline = clean_desc[:200] if clean_desc else title
+            # Detect sector from feed name
+            sector = "Mining" if any(k in feed_name for k in ("Mining", "Metals", "Rare", "Energy Metals")) else "TMT"
 
             filing = {
-                "source_id":   f"newsfile:{guid}",
-                "source":      "newsfile",
-                "issuer_name": ticker or title[:60],  # refined in Step 3 by AI
-                "doc_type":    feed_name,
-                "headline":    title,
-                "filing_date": filed_date,
-                "period_date": "",
-                "jurisdiction": jurisdiction,
-                "form_type":   feed_name,
-                "url":         link,
-                "fetched_at":  now,
+                "source_id":    f"newsfile:{guid}",
+                "source":       "newsfile",
+                "issuer_name":  ticker or "",
+                "doc_type":     feed_name,
+                "headline":     title,
+                "filing_date":  filed_date,
+                "period_date":  "",
+                "jurisdiction": jurisdiction or "CA",
+                "form_type":    feed_name,
+                "url":          link,
+                "fetched_at":   now,
             }
 
-            inserted = upsert_filing(conn, filing)
+            inserted = upsert_filing(db, filing)
             if inserted:
                 new_count += 1
-                log.info(
-                    "[Newsfile][NEW] %-50s  %s",
-                    title[:50], filed_date,
-                )
-
+                log.info("[Newsfile][NEW] %-50s  %s", title[:50], filed_date)
 
         time.sleep(REQUEST_DELAY)
 
@@ -451,85 +337,51 @@ def scrape_newsfile(
     return new_count
 
 
-# ── Source 3: Canadian media RSS feeds (supplemental) ────────────────────────
+# ── Source 3: Canadian media RSS ──────────────────────────────────────────────
 
 def _keyword_match(text: str) -> bool:
-    """
-    Return True if *text* contains at least one DEAL_KEYWORDS entry
-    (case-insensitive).  Both headline and description are checked by
-    the caller; a match on either field is sufficient.
-    """
     lower = text.lower()
     return any(kw.lower() in lower for kw in DEAL_KEYWORDS)
 
 
-def scrape_media(
-    conn: sqlite3.Connection,
-    session: requests.Session,
-    date_from: str,
-    date_to: str,
-) -> int:
-    """
-    Poll Financial Post, and Globe and Mail Business RSS feeds
-    for M&A-relevant articles.
-
-    Items are filtered through DEAL_KEYWORDS — only headlines/descriptions
-    containing at least one keyword are stored.  This keeps the DB focused
-    on deal-relevant coverage rather than general business news.
-
-    The source field is set to 'media' so these rows are easy to distinguish
-    from regulatory filings in downstream analysis.
-    """
+def scrape_media(db: SupabaseClient, session: requests.Session, date_from: str, date_to: str) -> int:
+    log.info("[Media] Scraping feeds %s → %s", date_from, date_to)
     new_count = 0
     cutoff_from = datetime.strptime(date_from, "%Y-%m-%d").date()
     cutoff_to   = datetime.strptime(date_to,   "%Y-%m-%d").date()
     now = datetime.now(timezone.utc).isoformat()
 
-    import re  # already used in scrape_newsfile; safe to re-import
+    import re
 
     for feed_name, feed_url in CANADIAN_MEDIA_FEEDS.items():
-        log.info("[Media] Fetching '%s' feed", feed_name)
-
+        log.info("[Media] Fetching '%s'", feed_name)
         try:
             resp = session.get(feed_url, headers=HEADERS, timeout=20)
             resp.raise_for_status()
-        except requests.RequestException as e:
-            log.warning("[Media] Failed to fetch '%s': %s", feed_name, e)
-            continue
-
-        try:
             root = ET.fromstring(resp.content)
-        except ET.ParseError as e:
-            log.warning("[Media] XML parse error for '%s': %s", feed_name, e)
+        except Exception as e:
+            log.warning("[Media] Failed '%s': %s", feed_name, e)
             continue
 
-        items = root.findall(".//item")
-        log.info("[Media] '%s' — %d items in feed", feed_name, len(items))
-
-        for item in items:
+        for item in root.findall(".//item"):
             title   = (item.findtext("title")       or "").strip()
             link    = (item.findtext("link")         or "").strip()
             pub_raw = (item.findtext("pubDate")      or "").strip()
             desc    = (item.findtext("description")  or "").strip()
             guid    = (item.findtext("guid")         or link).strip()
 
-            # Strip HTML tags for clean keyword matching and storage
             clean_desc = re.sub(r"<[^>]+>", "", desc).strip()
 
-            # ── Keyword filter ─────────────────────────────────────────────
             if not (_keyword_match(title) or _keyword_match(clean_desc)):
-                log.debug("[Media] Skipped (no keywords): %s", title[:80])
                 continue
 
             filed_date = _parse_rss_date(pub_raw)
-
-            # Date window filter
             try:
                 item_date = datetime.strptime(filed_date, "%Y-%m-%d").date()
                 if item_date < cutoff_from or item_date > cutoff_to:
                     continue
             except ValueError:
-                pass  # unparseable date — include anyway
+                pass
 
             ticker, jurisdiction = _extract_ticker(title)
             if not ticker:
@@ -551,13 +403,10 @@ def scrape_media(
                 "fetched_at":   now,
             }
 
-            inserted = upsert_filing(conn, filing)
+            inserted = upsert_filing(db, filing)
             if inserted:
                 new_count += 1
-                log.info(
-                    "[Media][NEW] %-50s  %s",
-                    title[:50], filed_date,
-                )
+                log.info("[Media][NEW] %-50s  %s", title[:50], filed_date)
 
         time.sleep(REQUEST_DELAY)
 
@@ -567,7 +416,7 @@ def scrape_media(
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
-def run_scrape(conn: sqlite3.Connection, days_back: int = 3) -> int:
+def run_scrape(db: SupabaseClient, days_back: int = 3) -> int:
     today     = datetime.now(timezone.utc).date()
     date_to   = today.strftime("%Y-%m-%d")
     date_from = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -575,60 +424,33 @@ def run_scrape(conn: sqlite3.Connection, days_back: int = 3) -> int:
     session   = requests.Session()
     total_new = 0
 
-    total_new += scrape_edgar(conn, session, date_from, date_to)
+    total_new += scrape_edgar(db, session, date_from, date_to)
+    total_new += scrape_newsfile(db, session, date_from, date_to)
+    total_new += scrape_media(db, session, date_from, date_to)
 
-    total_new += scrape_newsfile(conn, session, date_from, date_to)
+    log.info("── Run complete. %d new filings stored. ──", total_new)
 
-    total_new += scrape_media(conn, session, date_from, date_to)
+    # Keep only last 14 days
+    cutoff = (today - timedelta(days=14)).isoformat()
+    deleted = db.delete_old("filings", "filing_date", cutoff)
+    log.info("Cleanup: deleted %d filings older than %s", deleted, cutoff)
 
-    log.info("── Run complete.  %d new filings stored total. ──", total_new)
-    delete_old_filings(conn, days=7)
     return total_new
-
-def delete_old_filings(conn: sqlite3.Connection, days: int = 7) -> int:
-    """Delete filings older than `days` days. Returns number of rows deleted."""
-    cutoff = (date.today() - timedelta(days=days)).isoformat()
-    cur = conn.execute("DELETE FROM filings WHERE filing_date < ?", (cutoff,))
-    conn.commit()
-    log.info("Cleanup: deleted %d filings older than %s", cur.rowcount, cutoff)
-    return cur.rowcount
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Scrape SEDAR+ / EDGAR Material Change Reports into SQLite."
-    )
-    parser.add_argument("--days",   type=int,  default=3,
-                        help="Days back to search (default: 3)")
-    parser.add_argument("--poll",   type=int,  default=None, metavar="SECONDS",
-                        help="Keep running; re-scrape every N seconds")
-    parser.add_argument("--debug",  action="store_true",
-                        help="Enable verbose debug logging")
+    parser = argparse.ArgumentParser(description="Scrape deal filings into Supabase.")
+    parser.add_argument("--days",  type=int, default=3, help="Days back to search (default: 3)")
+    parser.add_argument("--debug", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # DB is opened once and reused — persists across all runs
-    conn = init_db()
-
-    if args.poll:
-        log.info("Polling every %d seconds.  Ctrl-C to stop.", args.poll)
-        while True:
-            try:
-                run_scrape(conn, args.days)
-            except KeyboardInterrupt:
-                log.info("Stopped.")
-                break
-            except Exception as exc:
-                log.error("Unexpected error: %s", exc)
-            time.sleep(args.poll)
-    else:
-        run_scrape(conn, args.days)
-
-    conn.close()
+    db = get_supabase()
+    run_scrape(db, args.days)
 
 
 if __name__ == "__main__":

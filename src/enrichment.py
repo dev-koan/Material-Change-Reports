@@ -1,6 +1,6 @@
 """
-enrichment.py  –  NER company extraction + sector classification
-================================================================
+enrichment.py  –  NER company extraction + sector classification (Supabase edition)
+===================================================================================
 
 Two features, zero external API calls:
 
@@ -18,30 +18,117 @@ Two features, zero external API calls:
   3. enrich_filing(row: dict) -> dict
      Adds 'sector' and 'companies' keys to a filing dict before insert.
 
-  4. enrich_db(db_path)
+  4. enrich_supabase()
      Back-fills sector + companies for every existing row that is still NULL.
      Safe to run multiple times (skips already-enriched rows).
 
 Usage:
-    python enrichment.py                  # back-fill existing DB
-    python enrichment.py --db custom.db   # specify a different DB path
+    python enrichment.py                  # back-fill existing Supabase data
+    python enrichment.py --dry-run        # preview changes without updating
+    python enrichment.py --batch 100      # process 100 rows at a time
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
-import sqlite3
 from pathlib import Path
 from typing import Optional
 
+import requests
+from dotenv import load_dotenv
+
+# ── Load environment variables ────────────────────────────────────────────────
+
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+else:
+    load_dotenv()
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
-# ── Sector classifier ─────────────────────────────────────────────────────────
+# ── Supabase client ───────────────────────────────────────────────────────────
 
-# Each sector maps to a list of lower-case keyword fragments.
-# The FIRST matching sector wins (order matters for ambiguous cases).
+class SupabaseClient:
+    def __init__(self):
+        self.url = os.environ["SUPABASE_URL"].rstrip("/")
+        self.key = os.environ["SUPABASE_KEY"]
+        self.headers = {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+        }
+
+    def get_unenriched(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Fetch filings where sector is NULL."""
+        resp = requests.get(
+            f"{self.url}/rest/v1/filings",
+            params={
+                "select": "*",
+                "sector": "is.null",
+                "limit": str(limit),
+                "offset": str(offset),
+                "order": "filing_date.asc",
+            },
+            headers=self.headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def update_filing(self, filing_id: int, sector: str, companies: str) -> bool:
+        """Update a filing with sector and companies."""
+        resp = requests.patch(
+            f"{self.url}/rest/v1/filings",
+            params={"id": f"eq.{filing_id}"},
+            json={"sector": sector, "companies": companies},
+            headers=self.headers,
+            timeout=30,
+        )
+        if resp.status_code not in (200, 204):
+            log.warning("Update failed for ID %s: %s", filing_id, resp.status_code)
+            return False
+        return True
+
+    def get_count_unenriched(self) -> int:
+        """Get count of filings needing enrichment."""
+        resp = requests.get(
+            f"{self.url}/rest/v1/filings",
+            params={
+                "select": "id",
+                "sector": "is.null",
+                "limit": 0,
+            },
+            headers=self.headers,
+            timeout=30,
+        )
+        # Supabase returns a count header
+        return int(resp.headers.get("Content-Range", "0/0").split("/")[-1] or 0)
+
+
+def get_supabase() -> SupabaseClient:
+    if not os.environ.get("SUPABASE_URL") or not os.environ.get("SUPABASE_KEY"):
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_KEY must be set as environment variables.\n"
+            "Create a .env file in the project root with:\n"
+            "    SUPABASE_URL=https://your-project-id.supabase.co\n"
+            "    SUPABASE_KEY=your-service-role-key"
+        )
+    return SupabaseClient()
+
+
+# ── Sector classifier (unchanged) ────────────────────────────────────────────
+
 SECTOR_KEYWORDS: dict[str, list[str]] = {
     "TMT": [
         "software",
@@ -103,73 +190,41 @@ SECTOR_KEYWORDS: dict[str, list[str]] = {
 
 
 def classify_sector(text: str) -> str:
-    """
-    Return the sector label for *text* (headline + description combined).
-
-    Strategy
-    --------
-    - Lowercase the text once.
-    - Walk sectors in definition order; first sector whose keyword list
-      contains any substring match wins.
-    - Return 'Unknown' if nothing matches.
-
-    Parameters
-    ----------
-    text : str
-        The combined text to classify (headline, description, or both).
-
-    Returns
-    -------
-    str
-        One of: 'TMT', 'Mining', or 'Unknown'.
-    """
+    """Return the sector label for *text*."""
     if not text:
         return "Unknown"
 
     lower = text.lower()
-
     for sector, keywords in SECTOR_KEYWORDS.items():
         for kw in keywords:
             if kw in lower:
                 log.debug("classify_sector: matched %r → %s", kw, sector)
                 return sector
-
     return "Unknown"
 
 
-# ── spaCy NER company extractor ───────────────────────────────────────────────
+# ── spaCy NER company extractor (unchanged) ──────────────────────────────────
 
-# Tokens we want to strip out even if spaCy tags them as ORG.
-# Includes exchanges, regulators, common noun phrases, and media outlets.
 _NER_BLOCKLIST: set[str] = {
-    # Exchanges & venues
     "TSX", "TSXV", "CSE", "NYSE", "NASDAQ", "LSE", "ASX",
     "TSX Venture Exchange", "Toronto Stock Exchange",
-    # Regulators / government
     "SEC", "OSC", "SEDAR", "SEDAR+", "EDGAR", "CRA", "IIROC", "CIRO",
     "Securities Commission",
-    # Media / wires
     "Reuters", "Bloomberg", "Globe and Mail", "Financial Post",
     "Newsfile", "Cision", "PR Newswire", "GlobeNewswire", "Marketwired",
-    # Generic noise
     "Q1", "Q2", "Q3", "Q4", "Inc", "Corp", "Ltd", "LLC",
 }
 
-# Compiled pattern to strip trailing legal suffixes from extracted names
-# so "Barrick Gold Corporation" → "Barrick Gold Corporation" stays intact
-# but ticker tags like "(TSX: ABX)" are removed.
 _TICKER_RE = re.compile(r"\s*\([A-Z]{2,6}(?:V)?:\s*[A-Z0-9.]+\)")
-
-_nlp = None  # lazy-loaded to avoid slow import at module level
+_nlp = None
 
 
 def _load_spacy():
-    """Lazy-load spaCy model; raise a clear error if not installed."""
     global _nlp
     if _nlp is not None:
         return _nlp
     try:
-        import spacy  # noqa: PLC0415
+        import spacy
         try:
             _nlp = spacy.load("en_core_web_sm")
         except OSError:
@@ -190,35 +245,13 @@ def _load_spacy():
 
 
 def extract_companies(text: str) -> list[str]:
-    """
-    Use spaCy NER to extract organisation names from *text*.
-
-    Steps
-    -----
-    1. Run the en_core_web_sm pipeline (tok2vec + NER only — no parser).
-    2. Collect all spans labelled 'ORG'.
-    3. Strip ticker tags and leading/trailing whitespace.
-    4. Remove entries in the blocklist (case-insensitive prefix match).
-    5. De-duplicate while preserving order.
-
-    Parameters
-    ----------
-    text : str
-        Raw headline or concatenated headline+description.
-
-    Returns
-    -------
-    list[str]
-        Deduplicated list of organisation names found; empty list if none.
-    """
+    """Use spaCy NER to extract organisation names from *text*."""
     if not text or not text.strip():
         return []
 
     nlp = _load_spacy()
-
-    # Disable everything except NER to keep it fast
     with nlp.select_pipes(enable=["tok2vec", "ner"]):
-        doc = nlp(text[:1_000])  # cap at 1 000 chars to stay snappy
+        doc = nlp(text[:1_000])
 
     seen: set[str] = set()
     results: list[str] = []
@@ -228,11 +261,9 @@ def extract_companies(text: str) -> list[str]:
             continue
 
         name = _TICKER_RE.sub("", ent.text).strip()
-
         if not name or len(name) < 3:
             continue
 
-        # Blocklist check — exact or prefix match
         upper = name.upper()
         blocked = any(
             upper == bl.upper() or upper.startswith(bl.upper())
@@ -251,23 +282,7 @@ def extract_companies(text: str) -> list[str]:
 # ── Per-filing enrichment ─────────────────────────────────────────────────────
 
 def enrich_filing(row: dict) -> dict:
-    """
-    Add 'sector' and 'companies' keys to a filing dict.
-
-    Combines headline and doc_type for better signal.  The 'companies'
-    value is stored as a pipe-delimited string so it fits cleanly in SQLite
-    without needing a second table.
-
-    Parameters
-    ----------
-    row : dict
-        A filing dict (same structure as passed to upsert_filing).
-
-    Returns
-    -------
-    dict
-        The same dict, mutated in place, with 'sector' and 'companies' set.
-    """
+    """Add 'sector' and 'companies' keys to a filing dict."""
     combined = " ".join(filter(None, [
         row.get("headline", ""),
         row.get("doc_type", ""),
@@ -286,116 +301,96 @@ def enrich_filing(row: dict) -> dict:
     return row
 
 
-# ── DB schema migration + back-fill ──────────────────────────────────────────
+# ── Supabase enrichment ──────────────────────────────────────────────────────
 
-DEFAULT_DB = Path(__file__).parent / "sedar_filings.db"
-
-
-def migrate_schema(conn: sqlite3.Connection) -> None:
+def enrich_supabase(batch_size: int = 100, dry_run: bool = False) -> int:
     """
-    Add 'sector' and 'companies' columns to the filings table if they don't
-    already exist.  Safe to call on both old and new databases.
+    Back-fill 'sector' and 'companies' for every existing row where sector is NULL.
+    
+    Args:
+        batch_size: Number of rows to process per batch
+        dry_run: If True, only preview changes without updating
+    
+    Returns:
+        Number of rows updated
     """
-    existing = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(filings)").fetchall()
-    }
-    for col, col_def in [("sector", "TEXT"), ("companies", "TEXT")]:
-        if col not in existing:
-            conn.execute(f"ALTER TABLE filings ADD COLUMN {col} {col_def}")
-            log.info("Schema: added column '%s'", col)
-    # Index for fast sector filtering
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sector ON filings (sector);"
-    )
-    conn.commit()
-
-
-def enrich_db(db_path: Path = DEFAULT_DB, batch_size: int = 200) -> int:
-    """
-    Back-fill 'sector' and 'companies' for every existing row where both
-    columns are still NULL.
-
-    Processes rows in batches of *batch_size* to keep memory usage low.
-    Commits after each batch.  Safe to interrupt and restart — already-
-    enriched rows (sector IS NOT NULL) are skipped.
-
-    Returns the total number of rows updated.
-    """
-    if not db_path.exists():
-        log.error("Database not found at %s — run scraper.py first.", db_path)
+    db = get_supabase()
+    
+    # Get total count
+    total_pending = db.get_count_unenriched()
+    if total_pending == 0:
+        log.info("All filings already enriched!")
         return 0
-
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    migrate_schema(conn)
-
-    total_pending = conn.execute(
-        "SELECT COUNT(*) FROM filings WHERE sector IS NULL"
-    ).fetchone()[0]
+    
     log.info("Back-fill: %d rows need enrichment.", total_pending)
-
+    
+    if dry_run:
+        log.info("DRY RUN: Would process %d rows", total_pending)
+        # Fetch and display a sample
+        sample = db.get_unenriched(limit=5)
+        log.info("Sample of rows to be enriched:")
+        for row in sample:
+            combined = " ".join(filter(None, [
+                row.get("headline", ""),
+                row.get("doc_type", ""),
+                row.get("issuer_name", ""),
+            ]))
+            sector = classify_sector(combined)
+            companies = extract_companies(combined) if combined else []
+            log.info("  ID %s: %s -> %s", row["id"], row["headline"][:50], sector)
+        return 0
+    
     updated = 0
-    offset  = 0
-
+    offset = 0
+    
     while True:
-        rows = conn.execute(
-            "SELECT id, headline, doc_type, issuer_name "
-            "FROM filings WHERE sector IS NULL "
-            "LIMIT ? OFFSET ?",
-            (batch_size, offset),
-        ).fetchall()
-
+        rows = db.get_unenriched(limit=batch_size, offset=offset)
         if not rows:
             break
-
+        
         for row in rows:
-            d = dict(row)
-            enrich_filing(d)
-            conn.execute(
-                "UPDATE filings SET sector=?, companies=? WHERE id=?",
-                (d["sector"], d["companies"], d["id"]),
+            # Enrich the row
+            enriched = enrich_filing(row)
+            
+            # Update in Supabase
+            success = db.update_filing(
+                row["id"], 
+                enriched["sector"], 
+                enriched["companies"]
             )
-            updated += 1
-
-        conn.commit()
-        offset  += len(rows)
-        log.info("Back-fill progress: %d / %d", updated, total_pending)
-
+            if success:
+                updated += 1
+                log.info("[%d/%d] Updated ID %s: %s", 
+                        updated, total_pending, row["id"], enriched["sector"])
+        
+        offset += len(rows)
+        log.info("Progress: %d / %d", updated, total_pending)
+    
     log.info("Back-fill complete. %d rows updated.", updated)
-    conn.close()
     return updated
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
     parser = argparse.ArgumentParser(
-        description="Back-fill sector & NER company data into the filings DB."
-    )
-    parser.add_argument(
-        "--db",
-        type=Path,
-        default=DEFAULT_DB,
-        metavar="PATH",
-        help=f"Path to SQLite database (default: {DEFAULT_DB})",
+        description="Back-fill sector & NER company data into Supabase."
     )
     parser.add_argument(
         "--batch",
         type=int,
-        default=200,
+        default=100,
         metavar="N",
-        help="Rows per commit batch (default: 200)",
+        help="Rows per batch (default: 100)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview changes without updating",
     )
     args = parser.parse_args()
 
-    enrich_db(args.db, args.batch)
+    enrich_supabase(batch_size=args.batch, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
