@@ -171,23 +171,6 @@ To trigger manually: go to **Actions → Daily scrape → Run workflow** in GitH
 
 ---
 
-## Project structure
-
-```
-.
-├── app.py              # Streamlit dashboard
-├── scraper.py          # Multi-source scraper (EDGAR, Newsfile, media RSS)
-├── enrichment.py       # Sector classifier + spaCy NER
-├── query_db.py         # CLI query / stats / CSV export
-├── sedar_filings.db    # SQLite database (git-tracked, auto-updated)
-├── requirements.txt    # Python dependencies
-└── .github/
-    └── workflows/
-        └── scrape.yml  # GitHub Actions daily job
-```
-
----
-
 ## Sector labels
 
 | Label     | Signal keywords (sample)                                          |
